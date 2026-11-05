@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>Starlight QLabs</title>
+        <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+        <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+        <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+        <link rel="icon" type="image/x-icon" href="./favicon.ico">
+        <link rel="manifest" href="/site.webmanifest">
+        <style>
+            /* body */
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #121212; margin: 0; padding-top: 0px;}
+
+            .current-cue-box { display: flex; background: #343835; border-top: 2px solid #ffffff; border-bottom: 2px solid #ffffff; flex: 1; flex-direction: column; align-items: center; }
+            .current-cue { display: flex; background: #343835; flex: 1; width: 100%; flex-direction: row; justify-content: space-around; align-items: center; }
+            .cue-text { font-size: 1.5rem; text-align: center; color: #ffffff; }
+            .time { font-family: monospace; font-size: 1.5rem; color: #ffffff;}
+
+            .progress-bar-container {margin: 20px 0 10px 0; width: 90%;}
+            .track-bar-bg {background: #333; width: 100%; height: 24px; border-radius: 5px; overflow: hidden; position: relative; border: 2px solid #444}
+            .track-bar-fill {background: #34a623; width: 0%; height: 100%; transition: width 0.3s linear;}
+            
+            .all-cues-container {list-style: none; padding: 0; margin: 0;}
+            .cue-item { display: flex; background: #343835; border-top: 2px solid #ffffff; border-bottom: 2px solid #ffffff; border-left: 6px solid transparent; flex-direction: row; justify-content: space-between; align-items: center; padding: 12px 15px 8px 15px; margin-bottom: 15px; }.cue-item:hover {background: #1c1f1d; border-left-color: #0077ff;}
+            .cue-item.next {border-left-color: #0077ff; background: #222;}
+            .cue-number {font-family: monospace; color: #ffffff; margin-right: 10px;}
+            .cue-title {flex-grow: 1; color: #ffffff;}
+            .cue-duration {font-family: monospace; color: #ffffff; font-size: 0.9rem;}
+            .all-cues-list { list-style: none; padding: 0; margin: 0; }
+            .empty-note { color: #aaaaaa; text-align: center; padding: 20px; }
+
+            header { border-bottom: 2px solid #ffffff; }
+            .header-text { font: 'segoe UI'; font-size: xx-large; text-align: center; color: #ffffff; }
+            .all-cues-header-text { font: 'segoe UI'; font-size: x-large; text-align: center; color: #ffffff; }
+        </style>
+    </head>
+    <body>
+        <header class = "header">
+            <h1 class = "header-text" id = "file-name">Starlight QLabs</h1>
+        </header>
+        <main>
+
+            <div class = "current-cue-box">
+                <div class = "current-cue">
+                    <h1 id = "current-cue-title" class = "cue-text">No Track Playing</h1>
+                    <div id = "current-cue-time" class = "time"> 00:00:00 / 00:00:00 </div>
+                </div>
+                <div class = "progress-bar-container">
+                    <div class = "track-bar-bg">
+                        <div class = "track-bar-fill" id = "progress-fill"></div>
+                    </div>
+                </div>
+            </div>
+
+            <div class = "all-cues-container">
+                <h2 class = "all-cues-header-text">Upcoming Tracks</h2>
+                <ul id = "upcoming-cues-list" class = "all-cues-list">
+
+                </ul>
+            </div>
+
+        </main>
+        <script>
+            
+            // FIX: follows whatever host/port served the page
+            const ws = new WebSocket(`ws://${location.host}`);
+
+            let wid = null;            // workspace id
+            let pollTimer = null;      // FIX: guard against duplicate polling timers
+            let reloadTimer = null;    // FIX: debounce for cue list reloads
+            let cues = [];             // flattened cue list
+            let durations = {};        // uniqueID -> duration (seconds)
+            let playheadId = null;     // uniqueID of the next cue to go
+
+            const $ = id => document.getElementById(id);
+            const send = (address, ...args) => {
+                if (ws.readyState === 1) ws.send(JSON.stringify({ address, args }));
+            };
+            const fmt = s => {
+                s = Math.max(0, Math.floor(s || 0));
+                const p = n => String(n).padStart(2, "0");
+                return `${p(Math.floor(s / 3600))}:${p(Math.floor(s / 60) % 60)}:${p(s % 60)}`;
+            };
+
+            // FIX: flatten nested cues (cues inside Groups), skipping the group containers themselves
+            function flatten(list, out = []) {
+                (list || []).forEach(c => {
+                    if (c.cues && c.cues.length) flatten(c.cues, out);
+                    else out.push(c);
+                });
+                return out;
+            }
+
+            function resetNowPlaying() {
+                $("current-cue-title").textContent = "No Track Playing";
+                $("current-cue-time").textContent = "00:00:00 / 00:00:00";
+                $("progress-fill").style.width = "0%";
+            }
+
+            // FIX: built with textContent, so names like "Act 1 <Intro> & Co" can't break the markup
+            // FIX: only shows cues from the playhead onward, and marks the first as "next"
+            function renderCues() {
+                const list = $("upcoming-cues-list");
+                list.replaceChildren();
+
+                let start = cues.findIndex(c => c.uniqueID === playheadId);
+                if (start < 0) start = 0;
+                const upcoming = cues.slice(start);
+
+                if (!upcoming.length) {
+                    const li = document.createElement("li");
+                    li.className = "empty-note";
+                    li.textContent = "No upcoming cues";
+                    list.appendChild(li);
+                    return;
+                }
+
+                upcoming.forEach((c, i) => {
+                    const li = document.createElement("li");
+                    li.className = "cue-item" + (i === 0 && c.uniqueID === playheadId ? " next" : "");
+                    li.id = `cue-${c.uniqueID}`;
+
+                    const num = document.createElement("span");
+                    num.className = "cue-number";
+                    num.textContent = c.number || "";
+
+                    const title = document.createElement("span");
+                    title.className = "cue-title";
+                    title.textContent = c.name || c.listName || "(untitled)";
+
+                    const dur = document.createElement("span");
+                    dur.className = "cue-duration";
+                    dur.textContent = durations[c.uniqueID] != null ? fmt(durations[c.uniqueID]) : "--:--:--";
+
+                    li.append(num, title, dur);
+                    list.appendChild(li);
+                });
+            }
+
+            function loadCueList() {
+                send(`/workspace/${wid}/cueLists`);
+            }
+
+            // FIX: debounced so a burst of /update messages causes only one reload
+            function scheduleReload() {
+                clearTimeout(reloadTimer);
+                reloadTimer = setTimeout(loadCueList, 300);
+            }
+
+            function pollActive() {
+                send(`/workspace/${wid}/cue/active/valuesForKeys`,
+                    JSON.stringify(["name", "duration", "actionElapsed", "percentElapsed"]));
+                send(`/workspace/${wid}/cue/playhead/valuesForKeys`,
+                    JSON.stringify(["uniqueID"]));
+            }
+
+            ws.onopen = () => send("/workspaces");
+
+            // FIX: if the bridge restarts, reload the page once it's back
+            ws.onclose = () => setTimeout(() => location.reload(), 2000);
+
+            ws.onmessage = (e) => {
+                const msg = JSON.parse(e.data);
+
+                // /update/... messages: refresh the cue list when something changes
+                if (msg.address.startsWith("/update")) {
+                    // playhead moves are already polled, so skip those to avoid reload storms
+                    if (wid && !msg.address.includes("playbackPosition")) scheduleReload();
+                    return;
+                }
+
+                if (!msg.args[0] || !msg.address.startsWith("/reply")) return;
+
+                let reply;
+                try { reply = JSON.parse(msg.args[0]); }
+                catch { return; }
+
+                // FIX: handle "nothing playing" BEFORE the generic status check
+                if (msg.address.includes("/cue/active/valuesForKeys")) {
+                    if (reply.status !== "ok" || !reply.data || !reply.data.name) {
+                        resetNowPlaying();
+                        return;
+                    }
+                    const d = reply.data;
+                    $("current-cue-title").textContent = d.name;
+                    $("current-cue-time").textContent = `${fmt(d.actionElapsed)} / ${fmt(d.duration)}`;
+                    $("progress-fill").style.width = ((d.percentElapsed || 0) * 100) + "%";
+                    return;
+                }
+
+                // Playhead changed -> re-render the upcoming list
+                if (msg.address.includes("/cue/playhead/valuesForKeys")) {
+                    const id = reply.status === "ok" && reply.data ? reply.data.uniqueID : null;
+                    if (id !== playheadId) {
+                        playheadId = id;
+                        renderCues();
+                    }
+                    return;
+                }
+
+                if (reply.status !== "ok") return console.warn(reply);
+
+                // 1. Workspaces -> pick the first, subscribe, load cues, start polling once
+                if (msg.address === "/reply/workspaces") {
+                    if (!reply.data || !reply.data.length) {
+                        $("current-cue-title").textContent = "Open a workspace in QLab";
+                        setTimeout(() => send("/workspaces"), 3000);
+                        return;
+                    }
+                    wid = reply.data[0].uniqueID;
+                    // send(`/workspace/${wid}/connect`, "yourPasscode");  // if you use a passcode
+                    send(`/workspace/${wid}/updates`, 1);
+                    loadCueList();
+                    $("file-name").textContent = reply.data[0].displayName;
+                    if (!pollTimer) pollTimer = setInterval(pollActive, 250);
+                }
+
+                // 2. Cue list -> flatten, render, then fetch each duration
+                else if (msg.address.endsWith("/cueLists")) {
+                    cues = [];
+                    (reply.data || []).forEach(l => flatten(l.cues, cues));
+                    renderCues();
+                    cues.forEach(c =>
+                        send(`/workspace/${wid}/cue_id/${c.uniqueID}/valuesForKeys`,
+                            JSON.stringify(["duration"])));
+                }
+
+                // 3. Per-cue duration (cueLists doesn't include it)
+                else if (msg.address.includes("/cue_id/") && msg.address.endsWith("/valuesForKeys")) {
+                    const id = msg.address.split("/cue_id/")[1].split("/")[0];
+                    durations[id] = reply.data.duration;
+                    const el = document.querySelector(`#cue-${CSS.escape(id)} .cue-duration`);
+                    if (el) el.textContent = fmt(reply.data.duration);
+                }
+            };
+        
+        </script>
+    </body>
+</html>
